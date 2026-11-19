@@ -617,6 +617,55 @@ TEST_F(DBTest, PutDeleteGet) {
   } while (ChangeOptions());
 }
 
+TEST_F(DBTest, BatchWriteImmediatelyVisible) {
+  do {
+    // Seed existing values, e.g. a previously loaded configuration.
+    ASSERT_LEVELDB_OK(Put("config:a", "old-a"));
+    ASSERT_LEVELDB_OK(Put("config:b", "old-b"));
+    ASSERT_LEVELDB_OK(Put("config:d", "old-d"));
+
+    // A snapshot taken before the batch stays pinned to the old version.
+    const Snapshot* snapshot = db_->GetSnapshot();
+
+    WriteBatch batch;
+    batch.Put("config:a", "new-a");
+    batch.Put("config:b", "new-b");
+    batch.Put("config:c", "new-c");
+    batch.Delete("config:d");
+    ASSERT_LEVELDB_OK(db_->Write(WriteOptions(), &batch));
+
+    // Reads immediately after the batch must observe the new values;
+    // no restart or memtable flush may be required.
+    ASSERT_EQ("new-a", Get("config:a"));
+    ASSERT_EQ("new-b", Get("config:b"));
+    ASSERT_EQ("new-c", Get("config:c"));
+    ASSERT_EQ("NOT_FOUND", Get("config:d"));
+
+    // The snapshot still observes the pre-batch version.
+    ASSERT_EQ("old-a", Get("config:a", snapshot));
+    ASSERT_EQ("old-b", Get("config:b", snapshot));
+    ASSERT_EQ("NOT_FOUND", Get("config:c", snapshot));
+    ASSERT_EQ("old-d", Get("config:d", snapshot));
+    db_->ReleaseSnapshot(snapshot);
+
+    // A fresh iterator also observes the post-batch contents.
+    Iterator* iter = db_->NewIterator(ReadOptions());
+    iter->Seek("config:a");
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ("config:a", iter->key().ToString());
+    ASSERT_EQ("new-a", iter->value().ToString());
+    delete iter;
+
+    // Every batch in a sequence is visible to the read that follows it.
+    for (int i = 0; i < 100; i++) {
+      WriteBatch b;
+      b.Put("key", "v" + NumberToString(i));
+      ASSERT_LEVELDB_OK(db_->Write(WriteOptions(), &b));
+      ASSERT_EQ("v" + NumberToString(i), Get("key"));
+    }
+  } while (ChangeOptions());
+}
+
 TEST_F(DBTest, GetFromImmutableLayer) {
   do {
     Options options = CurrentOptions();
@@ -1346,6 +1395,35 @@ TEST_F(DBTest, IteratorPinsRef) {
   iter->Next();
   ASSERT_TRUE(!iter->Valid());
   delete iter;
+}
+
+TEST_F(DBTest, IteratorReleasesPinnedVersionOnClose) {
+  ASSERT_LEVELDB_OK(Put("foo", "v1"));
+  Compact("a", "z");
+  const int num_files = CountFiles();
+
+  // An open iterator pins the version it was created on, so files that
+  // become obsolete while it is alive cannot be removed yet.
+  Iterator* iter = db_->NewIterator(ReadOptions());
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+
+  ASSERT_LEVELDB_OK(Put("foo", "v2"));
+  Compact("a", "z");
+  ASSERT_GT(CountFiles(), num_files);
+
+  // The iterator still observes the version it was created on.
+  iter->Seek("foo");
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ("v1", iter->value().ToString());
+
+  // Closing the iterator releases the pinned version; the next
+  // compaction reclaims the obsolete files.
+  delete iter;
+  ASSERT_LEVELDB_OK(Put("foo", "v3"));
+  Compact("a", "z");
+  ASSERT_EQ(num_files, CountFiles());
+  ASSERT_EQ("v3", Get("foo"));
 }
 
 TEST_F(DBTest, Snapshot) {
